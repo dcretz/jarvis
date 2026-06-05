@@ -1,13 +1,18 @@
 """
-Jarvis: live transcription + wake-word + local LLM with tool calling.
+Jarvis: dedicated wake-word + on-demand transcription + local LLM with tool calling.
 
 Flow:
-  microphone -> VAD -> Whisper -> transcript file (always)
-                                -> wake-word check
-                                     if "hey jarvis" detected:
-                                         send rest of utterance to Ollama
-                                         Ollama returns tool call(s)
-                                         we execute them, print result
+  microphone -> openWakeWord ("hey_jarvis", always-on, low-latency)
+                     if wake word detected:
+                         capture the following command utterance (Silero VAD)
+                         Whisper transcribes ONLY that command
+                         send command to Ollama
+                         Ollama returns tool call(s)
+                         we execute them, print/speak result
+
+Whisper is NO LONGER used to detect the wake word (that was unreliable — it
+depended on Whisper spelling "jarvis" correctly). A small always-on model
+listens for the wake word directly on the audio, like "Hey Siri".
 
 Run Ollama first:   `ollama serve`   (usually auto-starts on Windows)
 And pull a model:   `ollama pull qwen2.5:7b`   (or llama3.1:8b)
@@ -43,7 +48,8 @@ import requests
 import sounddevice as sd
 import torch
 from faster_whisper import WhisperModel
-from silero_vad import VADIterator, load_silero_vad
+from silero_vad import load_silero_vad
+from openwakeword.model import Model as OWWModel
 
 from tools import TOOLS, run_tool, DISPATCH
 from ha_tools import HA_TOOLS, HA_DISPATCH
@@ -153,11 +159,14 @@ def _is_repetitive(text: str) -> bool:
     most_common = Counter(chunks).most_common(1)
     return bool(most_common) and most_common[0][1] >= 3
 
-# === CONFIG: wake word ===
-# Whisper often hears "Jarvis" as "Jervis", "Charlie's", "Travis" etc. — fuzzy match catches most.
-WAKE_PHRASES   = ["hey jarvis", "hey jervis", "hi jarvis", "okay jarvis", "ok jarvis"]
-WAKE_FUZZY     = 0.75   # 0..1 — lower = more permissive
-FOLLOWUP_WINDOW_S = 8.0  # seconds we'll listen for a command after a bare wake word
+# === CONFIG: wake word (openWakeWord — dedicated always-on detector) ===
+OWW_MODEL        = "hey_jarvis"  # pretrained openWakeWord model (ships with the package)
+OWW_THRESHOLD    = 0.5           # 0..1 — raise to cut false triggers, lower to catch more
+VAD_SPEECH_PROB  = 0.5           # silero speech-prob threshold while capturing the command
+COMMAND_GRACE_MS = 6000          # after wake word, wait this long for the user to START speaking
+COMMAND_MAX_MS   = 12000         # hard cap on a single command's length
+# Kept only to strip a stray wake-word remnant off the front of the captured command:
+WAKE_FILLERS   = {"hey", "hi", "ok", "okay", "hello", "a", "the"}
 
 # === CONFIG: Ollama ===
 OLLAMA_URL   = "http://localhost:11434/api/chat"
@@ -251,12 +260,9 @@ whisper_model = WhisperModel(MODEL_SIZE, device=device, compute_type=compute_typ
 
 print("📥  Loading Silero VAD...")
 vad_model = load_silero_vad()
-vad_iterator = VADIterator(
-    vad_model,
-    sampling_rate=SAMPLE_RATE,
-    min_silence_duration_ms=MIN_SILENCE_MS,
-    speech_pad_ms=SPEECH_PAD_MS,
-)
+
+print(f"📥  Loading openWakeWord ('{OWW_MODEL}')...")
+oww_model = OWWModel(wakeword_models=[OWW_MODEL], inference_framework="onnx")
 
 import time
 
@@ -269,12 +275,9 @@ stop_event    = threading.Event()
 chat_history: list[dict] = []
 HISTORY_MAX_TURNS = 6
 
-# Follow-up state: when user says just "hey jarvis" we wait for next utterance
-_awaiting_followup_until: float = 0.0
-
 
 # ===============================================================
-# AUDIO + VAD + WHISPER  (unchanged from live_transcribe.py)
+# AUDIO + WAKE WORD + WHISPER
 # ===============================================================
 
 def audio_callback(indata, frames, time_info, status):
@@ -326,6 +329,11 @@ def is_hallucination(text: str, logprob: float) -> bool:
 
 
 def whisper_worker():
+    """Transcribe captured COMMAND buffers (post-wake-word) and dispatch to the LLM.
+
+    Whisper no longer runs continuously — it only transcribes the short utterance
+    that follows a wake-word detection, which is both faster and far more reliable.
+    """
     while not stop_event.is_set():
         try:
             audio = transcribe_q.get(timeout=0.2)
@@ -340,38 +348,49 @@ def whisper_worker():
             print(f"❌  Transcription error: {e}", file=sys.stderr)
             continue
 
-        if not text:
-            continue
-        if is_hallucination(text, logprob):
-            # Keep this — useful to see what's getting filtered
-            print(f"   🗑️  filtered: {text!r}")
+        if not text or is_hallucination(text, logprob):
+            print(f"   🗑️  no usable command heard ({text!r})")
             continue
 
+        command = strip_wake_prefix(text)
         ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] {text}")
+        print(f"[{ts}] command: {command!r}")
         with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {text}\n")
+            f.write(f"[{ts}] {command}\n")
             f.flush()
 
-        # === Wake-word check ===
-        global _awaiting_followup_until
-        command = extract_command(text)
-        if command is not None:
-            handle_command(command)
-        elif time.time() < _awaiting_followup_until:
-            # We're inside the follow-up window after a bare "hey jarvis"
-            print(f"   ↪️  treating as follow-up command")
-            _awaiting_followup_until = 0.0
-            handle_command(text)
+        if not command.strip():
+            print("   (wake word only — no command followed)")
+            continue
+        handle_command(command)
 
 
-def vad_loop():
-    pre_roll_samples = int(PRE_ROLL_MS * SAMPLE_RATE / 1000)
-    pre_roll = deque(maxlen=pre_roll_samples)
+def _chime():
+    """Short local beep so the user knows Jarvis is listening (like the Siri chime)."""
+    try:
+        import winsound
+        winsound.Beep(880, 120)
+    except Exception:
+        pass
 
-    speech_buffer: list[np.ndarray] = []
-    is_speaking = False
-    leftover = np.empty(0, dtype=np.float32)
+
+def listen_loop():
+    """Always-on wake-word detection.
+
+    IDLE: feed audio to openWakeWord. On detection, beep and switch to CAPTURING.
+    CAPTURING: record the command utterance, using Silero VAD to detect when the
+    user stops speaking (or a timeout), then hand the buffer to Whisper.
+    """
+    OWW_FRAME = 1280  # 80ms @ 16k — openWakeWord's native frame size
+
+    oww_leftover = np.empty(0, dtype=np.float32)
+    vad_leftover = np.empty(0, dtype=np.float32)
+
+    state = "IDLE"
+    cmd_buffer: list[np.ndarray] = []
+    cmd_started = False
+    total_samples = 0
+    silence_samples = 0
 
     while not stop_event.is_set():
         try:
@@ -379,38 +398,62 @@ def vad_loop():
         except queue.Empty:
             continue
 
-        data = np.concatenate([leftover, block]) if leftover.size else block
-        n_windows = len(data) // VAD_WINDOW
-        usable = n_windows * VAD_WINDOW
-        leftover = data[usable:].copy()
-        data = data[:usable]
+        if state == "IDLE":
+            data = np.concatenate([oww_leftover, block]) if oww_leftover.size else block
+            n = len(data) // OWW_FRAME
+            oww_leftover = data[n * OWW_FRAME:].copy()
+            for i in range(n):
+                frame = data[i * OWW_FRAME : (i + 1) * OWW_FRAME]
+                scores = oww_model.predict((frame * 32767).astype(np.int16))
+                if scores.get(OWW_MODEL, 0.0) >= OWW_THRESHOLD:
+                    print(f"\n🟢  Wake word! (score {scores[OWW_MODEL]:.2f}) — listening for command...")
+                    _chime()
+                    oww_model.reset()
+                    vad_model.reset_states()
+                    oww_leftover = np.empty(0, dtype=np.float32)
+                    vad_leftover = np.empty(0, dtype=np.float32)
+                    cmd_buffer, cmd_started = [], False
+                    total_samples, silence_samples = 0, 0
+                    state = "CAPTURING"
+                    break
+            continue
 
-        for i in range(n_windows):
-            window = data[i * VAD_WINDOW : (i + 1) * VAD_WINDOW]
-            pre_roll.extend(window)
+        # === CAPTURING the command utterance ===
+        data = np.concatenate([vad_leftover, block]) if vad_leftover.size else block
+        n = len(data) // VAD_WINDOW
+        vad_leftover = data[n * VAD_WINDOW:].copy()
+        usable = data[: n * VAD_WINDOW]
+        if usable.size:
+            cmd_buffer.append(usable)
 
-            if is_speaking:
-                speech_buffer.append(window)
+        for i in range(n):
+            window = usable[i * VAD_WINDOW : (i + 1) * VAD_WINDOW]
+            prob = vad_model(torch.from_numpy(window), SAMPLE_RATE).item()
+            total_samples += VAD_WINDOW
+            if prob >= VAD_SPEECH_PROB:
+                cmd_started = True
+                silence_samples = 0
+            else:
+                silence_samples += VAD_WINDOW
 
-            speech_dict = vad_iterator(torch.from_numpy(window), return_seconds=False)
-            if speech_dict is None:
-                continue
-
-            if "start" in speech_dict and not is_speaking:
-                is_speaking = True
-                speech_buffer = [np.array(pre_roll, dtype=np.float32)]
-
-            if "end" in speech_dict and is_speaking:
-                is_speaking = False
-                if speech_buffer:
-                    full = np.concatenate(speech_buffer)
-                    if len(full) / SAMPLE_RATE * 1000 >= MIN_SPEECH_MS:
-                        transcribe_q.put(full)
-                speech_buffer = []
+        # End-of-command conditions (samples / 16 == milliseconds at 16 kHz)
+        done = (
+            (cmd_started and silence_samples / 16 >= MIN_SILENCE_MS)
+            or (not cmd_started and total_samples / 16 >= COMMAND_GRACE_MS)
+            or (total_samples / 16 >= COMMAND_MAX_MS)
+        )
+        if done:
+            if cmd_started and cmd_buffer:
+                transcribe_q.put(np.concatenate(cmd_buffer))
+            else:
+                print("   (no command heard after wake word)")
+            oww_model.reset()
+            oww_leftover = np.empty(0, dtype=np.float32)
+            state = "IDLE"
 
 
 # ===============================================================
-# WAKE-WORD DETECTION
+# COMMAND CLEANUP
 # ===============================================================
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
@@ -420,30 +463,20 @@ def _normalize(s: str) -> str:
     return _PUNCT_RE.sub(" ", s.lower()).strip()
 
 
-def extract_command(text: str) -> str | None:
+def strip_wake_prefix(text: str) -> str:
+    """Remove a stray wake-word remnant from the start of a captured command.
+
+    Capture starts right after the wake word fires, so usually the command is
+    clean — but sometimes a tail like "...jarvis" or a filler "hey" leaks in.
+    Drop a leading filler and a jarvis-ish first word if present.
     """
-    If `text` starts with (or fuzzy-matches) a wake phrase, return the remainder.
-    Otherwise return None.
-    """
-    norm = _normalize(text)
-    if not norm:
-        return None
-
-    for phrase in WAKE_PHRASES:
-        # Exact prefix
-        if norm.startswith(phrase):
-            rest = norm[len(phrase):].strip()
-            return rest if rest else "(no command)"
-
-        # Fuzzy match on the first N words
-        n_words = len(phrase.split())
-        head = " ".join(norm.split()[:n_words])
-        ratio = SequenceMatcher(None, head, phrase).ratio()
-        if ratio >= WAKE_FUZZY:
-            rest = " ".join(norm.split()[n_words:]).strip()
-            return rest if rest else "(no command)"
-
-    return None
+    words = _normalize(text).split()
+    drop = 0
+    if words and words[0] in WAKE_FILLERS:
+        drop = 1
+    if drop < len(words) and SequenceMatcher(None, words[drop], "jarvis").ratio() >= 0.6:
+        drop += 1
+    return " ".join(words[drop:]).strip()
 
 
 # ===============================================================
@@ -491,13 +524,7 @@ def warmup_ollama():
 
 
 def handle_command(command: str):
-    global _awaiting_followup_until
     print(f"   🤖  Jarvis heard command: \"{command}\"")
-    if command == "(no command)":
-        print(f"   (listening for follow-up for {FOLLOWUP_WINDOW_S}s...)")
-        _awaiting_followup_until = time.time() + FOLLOWUP_WINDOW_S
-        return
-
     try:
         msg = call_ollama(command)
     except requests.exceptions.ConnectionError:
@@ -575,7 +602,7 @@ def check_ha_config():
 
 def main():
     print(f"🧠  LLM: {OLLAMA_MODEL} via Ollama")
-    print(f"👂  Wake phrases: {WAKE_PHRASES}")
+    print(f"👂  Wake word: '{OWW_MODEL}' (openWakeWord, threshold {OWW_THRESHOLD})")
     check_ha_config()
     list_audio_devices()
     warmup_ollama()
@@ -584,7 +611,7 @@ def main():
 
     worker = threading.Thread(target=whisper_worker, daemon=True)
     worker.start()
-    vad_thread = threading.Thread(target=vad_loop, daemon=True)
+    vad_thread = threading.Thread(target=listen_loop, daemon=True)
     vad_thread.start()
 
     try:

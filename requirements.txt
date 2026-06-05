@@ -1,0 +1,32 @@
+# Jarvis dependencies (Python 3.11)
+#
+# NVIDIA GPU (recommended — fast Whisper): install the CUDA build of torch FIRST
+# from PyTorch's index, then the rest from this file:
+#     pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+#     pip install -r requirements.txt
+#
+# CPU only: just run `pip install -r requirements.txt` (the plain torch below
+# installs the CPU build; Jarvis falls back to CPU automatically — Whisper is slower).
+
+# --- Wake word (always-on "hey jarvis" detector) ---
+openwakeword==0.6.0
+onnxruntime==1.26.0          # inference backend for openWakeWord
+
+# --- Speech-to-text + voice activity detection ---
+faster-whisper==1.2.1
+silero-vad==6.2.1
+torch==2.5.1                 # CPU build; for GPU see the note at the top of this file
+
+# --- Audio I/O ---
+sounddevice==0.5.5
+numpy==2.4.6
+
+# --- LLM dispatch (Ollama) ---
+requests==2.34.2
+
+# --- Config ---
+python-dotenv==1.2.2
+
+# --- Text-to-speech ---
+edge-tts==7.2.8
+pygame==2.6.1
