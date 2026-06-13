@@ -27,6 +27,12 @@ SPEED = "+10%"              # talk a bit faster than default (jarvis is brisk)
 _speech_queue: queue.Queue[str | None] = queue.Queue()
 _tts_thread: threading.Thread | None = None
 _tts_available: bool | None = None  # cached on first check
+_state_callback = None  # called with "speaking" or "idle"
+
+
+def set_state_callback(cb):
+    global _state_callback
+    _state_callback = cb
 
 
 def _check_available() -> bool:
@@ -74,10 +80,15 @@ def _tts_worker():
         if text is None:  # shutdown sentinel
             break
         try:
+            if _state_callback:
+                _state_callback("speaking")
             audio = asyncio.run(_synthesize(text))
             _play_mp3_bytes(audio)
         except Exception as e:
             print(f"⚠️  TTS error: {e}")
+        finally:
+            if _state_callback:
+                _state_callback("idle")
 
 
 def start():

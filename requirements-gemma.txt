@@ -1,0 +1,22 @@
+# gemma.py dependencies — Python 3.11
+#
+# STEP 1: install PyTorch >= 2.6 FIRST (gemma-4 audio tower REQUIRES torch>=2.6).
+# Build cu124 (needs NVIDIA driver >= ~550; e.g. 591.x works):
+#   pip install torch==2.6.0+cu124 torchaudio==2.6.0+cu124 torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+#
+# STEP 2: pip install -r requirements-gemma.txt
+#
+# transformers MUST come from git — the `any-to-any` pipeline gemma.py uses
+# is NOT in any released PyPI version. Pinned to the exact working commit:
+transformers @ git+https://github.com/huggingface/transformers.git@1b7bc25c46775af67c340478b01fedc70dfcc33e
+
+accelerate==1.13.0
+huggingface_hub==1.16.4
+safetensors==0.8.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
+protobuf==7.35.0
+soundfile==0.14.0
+librosa==0.11.0
+numpy==2.4.6
+bitsandbytes>=0.43.0          # 4-bit quantization so E4B fits in ~5 GB VRAM

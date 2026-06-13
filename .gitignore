@@ -1,2 +1,15 @@
 venv*
 .env
+__pycache__/
+*.pyc
+*.pyo
+
+# LLM model files
+*.safetensors
+*.bin
+*.gguf
+*.ggml
+*.onnx
+*.pt
+*.pth
+gemma-4-e4b-4bit/

@@ -30,3 +30,11 @@ python-dotenv==1.2.2
 # --- Text-to-speech ---
 edge-tts==7.2.8
 pygame==2.6.1
+
+# --- UI widget WebSocket server ---
+websockets>=13.0
+
+# --- YouTube Music controls ---
+ytmusicapi>=1.7.0        # search YT Music without auth, returns video IDs
+pyautogui>=0.9.54        # send keyboard shortcuts to browser window
+pygetwindow>=0.0.9       # focus Brave window with YouTube Music tab

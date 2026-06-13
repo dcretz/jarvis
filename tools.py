@@ -87,7 +87,11 @@ APP_LAUNCHERS: dict[str, str | list[str]] = {
     "cmd":      ["cmd.exe"],
     "powershell": ["powershell.exe"],
     "spotify":  "spotify:",                  # URI scheme — works if Spotify desktop is installed
-    "obsidian": [str(Path(os.environ.get("LOCALAPPDATA", r"C:\Users\diobe\AppData\Local")) / "Obsidian" / "Obsidian.exe")],
+    "obsidian": [str(Path(os.environ.get("LOCALAPPDATA", r"C:\Users\diobe\AppData\Local")) / "Programs" / "Obsidian" / "Obsidian.exe")],
+    "word":     [r"C:\Program Files (x86)\Microsoft Office\root\Office16\WINWORD.EXE"],
+    "excel":    [r"C:\Program Files (x86)\Microsoft Office\root\Office16\EXCEL.EXE"],
+    "powerpoint": [r"C:\Program Files (x86)\Microsoft Office\root\Office16\POWERPNT.EXE"],
+    "outlook":  [r"C:\Program Files (x86)\Microsoft Office\root\Office16\OUTLOOK.EXE"],
     "vscode":   ["code"],                    # requires `code` on PATH (VS Code installer option)
     "code":     ["code"],
     "brave":    None,                        # resolved at call time

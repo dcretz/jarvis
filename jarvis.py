@@ -22,6 +22,7 @@ Then:               `python jarvis.py`
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -53,11 +54,56 @@ from openwakeword.model import Model as OWWModel
 
 from tools import TOOLS, run_tool, DISPATCH
 from ha_tools import HA_TOOLS, HA_DISPATCH
+from youtube_tools import YOUTUBE_TOOLS, YOUTUBE_DISPATCH
 import tts
 
+try:
+    import websockets
+    _WS_AVAILABLE = True
+except ImportError:
+    _WS_AVAILABLE = False
+    print("⚠️  websockets not installed — UI widget won't receive events.")
+    print("   Install with: pip install websockets")
+
+# === WEBSOCKET SERVER (live UI widget) ===
+_ws_clients: set = set()
+_ws_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _ws_handler(websocket):
+    _ws_clients.add(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        _ws_clients.discard(websocket)
+
+
+async def _ws_serve():
+    async with websockets.serve(_ws_handler, "localhost", 8765):
+        await asyncio.Future()
+
+
+def _start_ws_server():
+    global _ws_loop
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
+    try:
+        _ws_loop.run_until_complete(_ws_serve())
+    except Exception as e:
+        print(f"⚠️  WebSocket server stopped: {e}")
+
+
+def broadcast(event: dict):
+    """Send a JSON event to every connected UI client (non-blocking)."""
+    if not _WS_AVAILABLE or _ws_loop is None or not _ws_clients:
+        return
+    msg = json.dumps(event)
+    for client in list(_ws_clients):
+        asyncio.run_coroutine_threadsafe(client.send(msg), _ws_loop)
+
 # Merge HA tools into the main registry
-ALL_TOOLS = TOOLS + HA_TOOLS
-ALL_DISPATCH = {**DISPATCH, **HA_DISPATCH}
+ALL_TOOLS = TOOLS + HA_TOOLS + YOUTUBE_TOOLS
+ALL_DISPATCH = {**DISPATCH, **HA_DISPATCH, **YOUTUBE_DISPATCH}
 
 
 def run_any_tool(name: str, args: dict) -> str:
@@ -231,6 +277,15 @@ User: open youtube
 User: open notepad
 → open_app(name="notepad")
 
+User: open word / deschide word
+→ open_app(name="word")
+
+User: open excel / deschide excel
+→ open_app(name="excel")
+
+User: open obsidian / deschide obsidian
+→ open_app(name="obsidian")
+
 User: start my day
 → start_my_day()
 
@@ -242,6 +297,30 @@ User: search for python tutorials
 
 User: what's the weather today
 → search_web(query="weather today")
+
+User: play Bohemian Rhapsody
+→ play_music(query="Bohemian Rhapsody")
+
+User: pune Eminem
+→ play_music(query="Eminem")
+
+User: play something by Daft Punk
+→ play_music(query="Daft Punk")
+
+User: next song / urmatoarea piesa / skip
+→ next_track()
+
+User: previous song / piesa anterioara / inapoi
+→ previous_track()
+
+User: pause / opreste muzica / pause music
+→ pause_music()
+
+User: resume / unpause / continua muzica
+→ resume_music()
+
+User: stop music / opreste tot
+→ stop_music()
 
 RULES:
 - Knowledge questions → chat_reply with the answer. NEVER search for things you already know.
@@ -361,8 +440,11 @@ def whisper_worker():
 
         if not command.strip():
             print("   (wake word only — no command followed)")
+            broadcast({"type": "state", "state": "idle"})
             continue
+        broadcast({"type": "message", "role": "user", "text": command})
         handle_command(command)
+        broadcast({"type": "state", "state": "idle"})
 
 
 def _chime():
@@ -398,58 +480,80 @@ def listen_loop():
         except queue.Empty:
             continue
 
-        if state == "IDLE":
-            data = np.concatenate([oww_leftover, block]) if oww_leftover.size else block
-            n = len(data) // OWW_FRAME
-            oww_leftover = data[n * OWW_FRAME:].copy()
+        try:
+            if state == "IDLE":
+                data = np.concatenate([oww_leftover, block]) if oww_leftover.size else block
+                n = len(data) // OWW_FRAME
+                oww_leftover = data[n * OWW_FRAME:].copy()
+                for i in range(n):
+                    frame = data[i * OWW_FRAME : (i + 1) * OWW_FRAME]
+                    scores = oww_model.predict((frame * 32767).astype(np.int16))
+                    if scores.get(OWW_MODEL, 0.0) >= OWW_THRESHOLD:
+                        print(f"\n🟢  Wake word! (score {scores[OWW_MODEL]:.2f}) — listening for command...")
+                        broadcast({"type": "state", "state": "listening"})
+                        _chime()
+                        oww_model.reset()
+                        vad_model.reset_states()
+                        oww_leftover = np.empty(0, dtype=np.float32)
+                        vad_leftover = np.empty(0, dtype=np.float32)
+                        cmd_buffer, cmd_started = [], False
+                        total_samples, silence_samples = 0, 0
+                        state = "CAPTURING"
+                        break
+                continue
+
+            # === CAPTURING the command utterance ===
+            data = np.concatenate([vad_leftover, block]) if vad_leftover.size else block
+            n = len(data) // VAD_WINDOW
+            vad_leftover = data[n * VAD_WINDOW:].copy()
+            usable = data[: n * VAD_WINDOW]
+            if usable.size:
+                cmd_buffer.append(usable)
+
             for i in range(n):
-                frame = data[i * OWW_FRAME : (i + 1) * OWW_FRAME]
-                scores = oww_model.predict((frame * 32767).astype(np.int16))
-                if scores.get(OWW_MODEL, 0.0) >= OWW_THRESHOLD:
-                    print(f"\n🟢  Wake word! (score {scores[OWW_MODEL]:.2f}) — listening for command...")
-                    _chime()
-                    oww_model.reset()
-                    vad_model.reset_states()
-                    oww_leftover = np.empty(0, dtype=np.float32)
-                    vad_leftover = np.empty(0, dtype=np.float32)
-                    cmd_buffer, cmd_started = [], False
-                    total_samples, silence_samples = 0, 0
-                    state = "CAPTURING"
-                    break
-            continue
+                window = usable[i * VAD_WINDOW : (i + 1) * VAD_WINDOW]
+                prob = vad_model(torch.from_numpy(window), SAMPLE_RATE).item()
+                total_samples += VAD_WINDOW
+                if prob >= VAD_SPEECH_PROB:
+                    cmd_started = True
+                    silence_samples = 0
+                else:
+                    silence_samples += VAD_WINDOW
 
-        # === CAPTURING the command utterance ===
-        data = np.concatenate([vad_leftover, block]) if vad_leftover.size else block
-        n = len(data) // VAD_WINDOW
-        vad_leftover = data[n * VAD_WINDOW:].copy()
-        usable = data[: n * VAD_WINDOW]
-        if usable.size:
-            cmd_buffer.append(usable)
+            # End-of-command conditions (samples / 16 == milliseconds at 16 kHz)
+            done = (
+                (cmd_started and silence_samples / 16 >= MIN_SILENCE_MS)
+                or (not cmd_started and total_samples / 16 >= COMMAND_GRACE_MS)
+                or (total_samples / 16 >= COMMAND_MAX_MS)
+            )
+            if done:
+                if cmd_started and cmd_buffer:
+                    transcribe_q.put(np.concatenate(cmd_buffer))
+                else:
+                    print("   (no command heard after wake word)")
+                oww_model.reset()
+                vad_model.reset_states()
+                oww_leftover = np.empty(0, dtype=np.float32)
+                vad_leftover = np.empty(0, dtype=np.float32)
+                state = "IDLE"
+                broadcast({"type": "state", "state": "idle"})
 
-        for i in range(n):
-            window = usable[i * VAD_WINDOW : (i + 1) * VAD_WINDOW]
-            prob = vad_model(torch.from_numpy(window), SAMPLE_RATE).item()
-            total_samples += VAD_WINDOW
-            if prob >= VAD_SPEECH_PROB:
-                cmd_started = True
-                silence_samples = 0
-            else:
-                silence_samples += VAD_WINDOW
-
-        # End-of-command conditions (samples / 16 == milliseconds at 16 kHz)
-        done = (
-            (cmd_started and silence_samples / 16 >= MIN_SILENCE_MS)
-            or (not cmd_started and total_samples / 16 >= COMMAND_GRACE_MS)
-            or (total_samples / 16 >= COMMAND_MAX_MS)
-        )
-        if done:
-            if cmd_started and cmd_buffer:
-                transcribe_q.put(np.concatenate(cmd_buffer))
-            else:
-                print("   (no command heard after wake word)")
-            oww_model.reset()
+        except Exception as e:
+            print(f"❌  listen_loop error (resetting to IDLE): {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            # Reset to a clean state so the loop can recover
+            try:
+                oww_model.reset()
+                vad_model.reset_states()
+            except Exception:
+                pass
             oww_leftover = np.empty(0, dtype=np.float32)
+            vad_leftover = np.empty(0, dtype=np.float32)
+            cmd_buffer, cmd_started = [], False
+            total_samples, silence_samples = 0, 0
             state = "IDLE"
+            broadcast({"type": "state", "state": "idle"})
 
 
 # ===============================================================
@@ -525,6 +629,7 @@ def warmup_ollama():
 
 def handle_command(command: str):
     print(f"   🤖  Jarvis heard command: \"{command}\"")
+    broadcast({"type": "state", "state": "thinking"})
     try:
         msg = call_ollama(command)
     except requests.exceptions.ConnectionError:
@@ -543,6 +648,7 @@ def handle_command(command: str):
         content = msg.get("content", "").strip()
         if content:
             print(f"   💬  {content}")
+            broadcast({"type": "message", "role": "jarvis", "text": content})
             tts.speak(content)
         else:
             print("   (no response)")
@@ -562,14 +668,19 @@ def handle_command(command: str):
         result = run_any_tool(name, args)
         print(f"   ⚙️   {name}({args}) → {result}")
 
-        # Speak the result for chat_reply (full answer) and for everything else (short ack)
         if name == "chat_reply":
-            tts.speak(result)  # result == the reply text itself
+            broadcast({"type": "message", "role": "jarvis", "text": result})
+            tts.speak(result)
         elif name == "control_light":
-            tts.speak(result)  # "Turned on bucatarie."
+            broadcast({"type": "message", "role": "jarvis", "text": result})
+            tts.speak(result)
         elif name == "start_my_day":
-            tts.speak(result)  # spoken morning briefing
-        # For open_url / open_app / search_web, we don't speak (browser opening is its own feedback)
+            broadcast({"type": "message", "role": "jarvis", "text": result})
+            tts.speak(result)
+        elif name in ("play_music", "pause_music", "resume_music",
+                      "next_track", "previous_track", "stop_music"):
+            broadcast({"type": "message", "role": "jarvis", "text": result})
+            tts.speak(result)
 
 
 # ===============================================================
@@ -607,6 +718,13 @@ def main():
     list_audio_devices()
     warmup_ollama()
     tts.start()
+    tts.set_state_callback(lambda s: broadcast({"type": "state", "state": s}))
+
+    if _WS_AVAILABLE:
+        ws_thread = threading.Thread(target=_start_ws_server, daemon=True, name="ws-server")
+        ws_thread.start()
+        print("🌐  WebSocket UI server listening on ws://localhost:8765")
+
     print("🎤  Listening... say 'hey jarvis, ...' (Ctrl+C to stop)\n")
 
     worker = threading.Thread(target=whisper_worker, daemon=True)
